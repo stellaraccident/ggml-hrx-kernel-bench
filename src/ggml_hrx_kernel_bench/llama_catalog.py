@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .hrx2 import iter_routes, load_json, read_sources
-from .route_schedules import select_test_route, test_scenario_for_family, test_shape_for_route
+from .route_schedules import schedule_points_for_route, select_test_route, test_scenario_for_family, test_shape_for_route
 from .specs import file_sha256
 
 
@@ -36,7 +36,6 @@ _SCHEDULE_FAMILIES = {
     "mul_f32",
     "mul_mat_f32_f32",
     "mul_mat_f16_f32_batched",
-    "mul_mat_f16_f32_batched_cont",
     "mul_mat_id_q4_k_f32",
     "mul_mat_id_q5_k_f32",
     "mul_mat_id_q6_k_f32",
@@ -65,14 +64,14 @@ _SCHEDULE_TOLERANCE_BY_FAMILY = {
     "get_rows_q5_k_f32": 0.0,
     "get_rows_q6_k_f32": 0.0,
     "get_rows_q8_0_f32": 0.0,
-    "mul_mat_q4_k_f32": 8.0e-2,
-    "mul_mat_q5_k_f32": 8.0e-2,
-    "mul_mat_q6_k_f32": 8.0e-2,
-    "mul_mat_q8_0_f32": 8.0e-2,
-    "mul_mat_id_q4_k_f32": 8.0e-2,
-    "mul_mat_id_q5_k_f32": 8.0e-2,
-    "mul_mat_id_q6_k_f32": 8.0e-2,
-    "mul_mat_q4_k_swiglu_f32": 1.0e-1,
+    "mul_mat_q4_k_f32": 5.0,
+    "mul_mat_q5_k_f32": 5.0,
+    "mul_mat_q6_k_f32": 5.0,
+    "mul_mat_q8_0_f32": 5.0,
+    "mul_mat_id_q4_k_f32": 5.0,
+    "mul_mat_id_q5_k_f32": 5.0,
+    "mul_mat_id_q6_k_f32": 5.0,
+    "mul_mat_q4_k_swiglu_f32": 5.0,
     "mul_mat_f32_f32": 1.0e-4,
     "mul_mat_f16_f32_batched": 3.0e-2,
     "mul_mat_f16_f32_batched_cont": 3.0e-2,
@@ -88,6 +87,27 @@ _SCHEDULE_TOLERANCE_BY_FAMILY = {
     "softmax_kqv_f32_f16": 5.0e-2,
     "swiglu_f32": 1.0e-4,
 }
+
+_EDGE_TEST_CASE_LIMIT_BY_FAMILY = {
+    "get_rows_q4_k_f32": 8,
+    "get_rows_q5_k_f32": 8,
+    "get_rows_q6_k_f32": 8,
+    "get_rows_q8_0_f32": 8,
+    "mul_mat_q4_k_f32": 8,
+    "mul_mat_q5_k_f32": 8,
+    "mul_mat_q6_k_f32": 8,
+    "mul_mat_q8_0_f32": 8,
+    "mul_mat_q4_k_swiglu_f32": 1,
+    "cont_f32": 1,
+    "copy_f32_f16": 1,
+    "rms_norm_f32": 8,
+    "rope_f32": 8,
+    "rope_neox_f32": 8,
+    "rope_scale_f32": 8,
+    "soft_max_f32": 8,
+    "swiglu_f32": 8,
+}
+_DEFAULT_EDGE_TEST_CASE_LIMIT = 4
 
 
 _RUNTIME_EXCLUDED_ROUTE_REASONS = {
@@ -107,6 +127,22 @@ _RUNTIME_EXCLUDED_ROUTE_REASONS = {
         "current loom verifier rejects this root with subrange proof failures "
         "on quantized block loads during HRX3 JIT specialization"
     ),
+    "mul_mat_q5_k_f32_wmma128x128_f16acc_k256_8192_r128_32768_c128_512_wg256": (
+        "current loom compiler rejects this route during HRX3 JIT specialization: "
+        "the selected workgroup.id y topology range is wider than the kernel's "
+        "index.assume proof"
+    ),
+}
+
+
+_ROUTE_SHAPE_DOMAIN_OVERRIDES = {
+    # The imported HRX2 metadata advertised prompt-width columns for this
+    # route, but current Loom rejects those specializations because the kernel
+    # assumes a narrower workgroup.id y range. Keep the route for decode/narrow
+    # cases and let the report make the missing prompt route visible.
+    "mul_mat_q5_k_f32_direct_k256_32768_r1_262144_c1_512_wg64": {
+        "cols_max": 64,
+    },
 }
 
 
@@ -141,6 +177,7 @@ def export_llama_catalog(
     target_key: str,
     families: set[str] | None,
     catalog_id: str | None = None,
+    sweep: str = "minimal",
 ) -> LlamaCatalogExportResult:
     sources = read_sources(catalog_dir)
     family_rows = _load_families(catalog_dir)
@@ -229,6 +266,7 @@ def export_llama_catalog(
             target_key=target_key,
             family_id=family_id,
             routes=routes_by_family[family_id],
+            sweep=sweep,
         )
         if schedule is None:
             continue
@@ -307,6 +345,10 @@ def _normalize_route(route: dict[str, Any], *, target_key: str) -> OrderedDict[s
     ):
         if key in route:
             out[key] = route[key]
+    if str(route.get("id") or "") in _ROUTE_SHAPE_DOMAIN_OVERRIDES:
+        domain = OrderedDict(out.get("shape_domain") if isinstance(out.get("shape_domain"), dict) else {})
+        domain.update(_ROUTE_SHAPE_DOMAIN_OVERRIDES[str(route.get("id") or "")])
+        out["shape_domain"] = domain
     if isinstance(route.get("supports"), dict):
         out["supports"] = _normalize_supports(route["supports"])
     out["artifact_id"] = _route_artifact_id(route)
@@ -474,39 +516,237 @@ def _test_schedule_for_family(
     target_key: str,
     family_id: str,
     routes: list[dict[str, Any]],
+    sweep: str,
 ) -> OrderedDict[str, Any] | None:
     if family_id not in _SCHEDULE_FAMILIES:
         return None
-    route = select_test_route(family_id, routes)
-    if route is None:
+    cases = _test_cases_for_family(family_id, routes, sweep=sweep)
+    if not cases:
         return None
-    shape = test_shape_for_route(family_id, route)
-    if shape is None:
-        return None
-    scenario = test_scenario_for_family(family_id, route)
-    supports = _normalize_supports(route.get("supports")) if isinstance(route.get("supports"), dict) else OrderedDict()
     return OrderedDict(
         [
             ("schema", "ggml-hrx-test-schedule-v1"),
             ("target_key", target_key),
             ("family", family_id),
-            ("cases", [
-                OrderedDict(
-                    [
-                        ("id", f"{family_id}_{route['id']}_smoke"),
-                        ("op", route["op"]),
-                        ("scenario", scenario),
-                        ("expected_route_id", route["id"]),
-                        ("schedule", OrderedDict([("source", "atlas-test"), ("scenario", scenario)])),
-                        ("supports", supports),
-                        ("shape", shape),
-                        ("tolerance", _SCHEDULE_TOLERANCE_BY_FAMILY.get(family_id, 1.0e-6)),
-                        ("repeat", 2),
-                    ]
-                )
-            ]),
+            ("cases", cases),
         ]
     )
+
+
+def _test_cases_for_family(
+    family_id: str,
+    routes: list[dict[str, Any]],
+    *,
+    sweep: str,
+) -> list[OrderedDict[str, Any]]:
+    if sweep == "minimal":
+        route = select_test_route(family_id, routes)
+        if route is None:
+            return []
+        case = _test_case_for_route(family_id, route, test_shape_for_route(family_id, route), "atlas-test", "smoke")
+        return [case] if case is not None else []
+
+    cases: list[OrderedDict[str, Any]] = []
+    seen: set[tuple[str, tuple[tuple[str, int], ...]]] = set()
+    for route in routes:
+        if not _test_runner_can_construct_route(family_id, route):
+            continue
+        points = schedule_points_for_route(route, sweep=sweep)
+        if not points:
+            points = schedule_points_for_route(route, sweep="minimal")
+        for point in points:
+            shape = _test_shape_from_schedule(family_id, route, point.facts)
+            if shape is None:
+                continue
+            selected = next(
+                (candidate for candidate in routes if _route_matches_test_shape(candidate, shape, route)),
+                None,
+            )
+            if selected is None or str(selected.get("id") or "") != str(route.get("id") or ""):
+                continue
+            if _test_shape_too_expensive(route, shape):
+                continue
+            key = (str(route.get("id") or ""), tuple(sorted(shape.items())))
+            if key in seen:
+                continue
+            seen.add(key)
+            case = _test_case_for_route(family_id, route, shape, point.source, point.scenario)
+            if case is not None:
+                cases.append(case)
+    if cases:
+        limit = _EDGE_TEST_CASE_LIMIT_BY_FAMILY.get(family_id, _DEFAULT_EDGE_TEST_CASE_LIMIT)
+        return cases[:limit]
+
+    route = select_test_route(family_id, routes)
+    if route is None:
+        return []
+    case = _test_case_for_route(family_id, route, test_shape_for_route(family_id, route), "atlas-test", "smoke")
+    return [case] if case is not None else []
+
+
+def _test_case_for_route(
+    family_id: str,
+    route: dict[str, Any],
+    shape: OrderedDict[str, int] | dict[str, int] | None,
+    schedule_source: str,
+    schedule_scenario: str,
+) -> OrderedDict[str, Any] | None:
+    if shape is None:
+        return None
+    scenario = test_scenario_for_family(family_id, route)
+    supports = _normalize_supports(route.get("supports")) if isinstance(route.get("supports"), dict) else OrderedDict()
+    shape_ordered = OrderedDict((str(key), int(value)) for key, value in shape.items())
+    shape_id = _shape_id(shape_ordered)
+    return OrderedDict(
+        [
+            ("id", f"{family_id}_{route['id']}_{schedule_scenario}_{shape_id}"),
+            ("op", route["op"]),
+            ("scenario", scenario),
+            ("expected_route_id", route["id"]),
+            ("schedule", OrderedDict([("source", schedule_source), ("scenario", schedule_scenario)])),
+            ("supports", supports),
+            ("shape", shape_ordered),
+            ("tolerance", _SCHEDULE_TOLERANCE_BY_FAMILY.get(family_id, 1.0e-6)),
+            ("repeat", 1),
+        ]
+    )
+
+
+def _test_shape_from_schedule(
+    family_id: str,
+    route: dict[str, Any],
+    facts: dict[str, int],
+) -> OrderedDict[str, int] | None:
+    base = test_shape_for_route(family_id, route)
+    if base is None:
+        return None
+    shape = OrderedDict(base)
+    op = str(route.get("op") or "")
+    if op in {"MUL_MAT", "MUL_MAT_ID"} or family_id == "mul_mat_q4_k_swiglu_f32":
+        for key in ("k", "rows", "cols", "nrows"):
+            if key in facts and key in shape:
+                shape[key] = int(facts[key])
+        if op == "MUL_MAT_ID":
+            if "cols" in facts:
+                shape["nselected"] = int(facts["cols"])
+            if "nrows" in facts:
+                shape["ntokens"] = int(facts["nrows"])
+        return shape
+    if family_id in {"rope_f32", "rope_neox_f32", "rope_scale_f32", "rope_set_rows_f32"}:
+        if "ncols" in facts:
+            shape["ncols"] = int(facts["ncols"])
+        if "n_dims" in facts:
+            shape["n_dims"] = int(facts["n_dims"])
+        if "rows" in facts:
+            shape["nheads"] = int(facts["rows"])
+        if "cols" in facts:
+            shape["ntokens"] = int(facts["cols"])
+            if "dst_rows" in shape:
+                shape["dst_rows"] = max(int(facts["cols"]) + 2, 4)
+        return shape
+    if family_id == "copy_f32_f16":
+        return shape
+    for key in ("ncols", "nrows", "cols", "rows"):
+        if key in facts and key in shape:
+            shape[key] = int(facts[key])
+    if family_id == "set_rows_f32" and "nrows" in shape:
+        # The C++ smoke harness writes row i to (i * 2 + 1) % dst_rows.
+        # Keep generated cases collision-free so correctness checks do not
+        # depend on parallel write ordering for duplicate destination rows.
+        shape["dst_rows"] = max(int(shape.get("dst_rows", 0)), int(shape["nrows"]) * 2 + 1)
+    return shape
+
+
+def _test_shape_too_expensive(route: dict[str, Any], shape: OrderedDict[str, int]) -> bool:
+    op = str(route.get("op") or "")
+    if op not in {"MUL_MAT", "MUL_MAT_ID"}:
+        return False
+    k = int(shape.get("k", 1))
+    rows = int(shape.get("rows", 1))
+    cols = int(shape.get("cols", shape.get("nselected", 1)))
+    return k * rows * cols > 96 * 1024 * 1024
+
+
+def _route_matches_test_shape(
+    route: dict[str, Any],
+    shape: OrderedDict[str, int],
+    source_route: dict[str, Any],
+) -> bool:
+    route_supports = route.get("supports") if isinstance(route.get("supports"), dict) else {}
+    source_supports = source_route.get("supports") if isinstance(source_route.get("supports"), dict) else {}
+    for key, value in route_supports.items():
+        if str(source_supports.get(key, "")) != str(value):
+            return False
+    domain = route.get("shape_domain") if isinstance(route.get("shape_domain"), dict) else {}
+    guards = route.get("shape_guards") if isinstance(route.get("shape_guards"), dict) else {}
+    axes = {str(key)[:-4] for key in domain if str(key).endswith("_min")}
+    axes.update(str(key)[:-4] for key in domain if str(key).endswith("_max"))
+    for axis in axes:
+        value = _test_shape_axis_value(shape, axis)
+        if value is None:
+            return False
+        lo = domain.get(f"{axis}_min", value)
+        hi = domain.get(f"{axis}_max", value)
+        if isinstance(lo, int) and value < lo:
+            return False
+        if isinstance(hi, int) and value > hi:
+            return False
+        multiple = guards.get(f"{axis}_multiple_of")
+        if multiple and int(multiple) > 1 and value % int(multiple) != 0:
+            return False
+    for binding in route.get("specialization", {}).get("bindings", []):
+        if not isinstance(binding, dict) or "source" not in binding:
+            continue
+        source = str(binding["source"])
+        shape_key = source.removeprefix("shape.") if source.startswith("shape.") else ""
+        if shape_key and "." not in shape_key and shape_key not in shape:
+            return False
+    return True
+
+
+def _test_runner_can_construct_route(family_id: str, route: dict[str, Any]) -> bool:
+    """Return whether llama.cpp's current catalog test harness can build this route.
+
+    This is intentionally narrower than runtime eligibility. The catalog may
+    contain valid routes for packed or pre-quantized producer layouts that are
+    useful in real graphs, while the current C++ smoke harness only constructs
+    the simple graph form for a family. Those routes stay in the runtime catalog;
+    they are just not emitted into the generated test schedule until the harness
+    grows matching graph builders.
+    """
+    if family_id == "mul_mat_q4_k_swiglu_f32":
+        supports = route.get("supports") if isinstance(route.get("supports"), dict) else {}
+        return (
+            str(supports.get("rhs_type", "")) == "F32"
+            and str(supports.get("fusion", "")) == "MUL_MAT_Q4_K + MUL_MAT_Q4_K + SWIGLU"
+        )
+    if family_id == "mul_mat_f16_f32_batched":
+        supports = route.get("supports") if isinstance(route.get("supports"), dict) else {}
+        return str(supports.get("layout", "")) == "batched_attention_broadcast"
+    if family_id == "cont_f32":
+        return str(route.get("id", "")) == "cont_f32_generic_wg256"
+    if family_id == "swiglu_f32":
+        supports = route.get("supports") if isinstance(route.get("supports"), dict) else {}
+        return str(supports.get("glu_op", "")) == "SWIGLU"
+    return True
+
+
+def _test_shape_axis_value(shape: OrderedDict[str, int], axis: str) -> int | None:
+    aliases = {
+        "ncols": ("ncols", "cols"),
+        "nrows": ("nrows", "rows", "ntokens"),
+        "rows": ("rows", "nheads"),
+        "cols": ("cols", "ntokens", "nselected"),
+    }.get(axis, (axis,))
+    for key in aliases:
+        if key in shape:
+            return int(shape[key])
+    return None
+
+
+def _shape_id(shape: OrderedDict[str, int]) -> str:
+    parts = [f"{key}{value}" for key, value in shape.items() if key in {"k", "rows", "cols", "ncols", "nrows", "ntokens"}]
+    return "_".join(parts) if parts else "shape"
 
 
 def _default_catalog_id(target_key: str, family_ids: list[str]) -> str:

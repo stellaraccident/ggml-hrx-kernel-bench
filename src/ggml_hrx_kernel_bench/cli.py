@@ -340,6 +340,7 @@ def command_export_llama(args: argparse.Namespace, ledger: LedgerWriter) -> int:
         target_key=args.target,
         families=filter_set(args.family),
         catalog_id=args.llama_catalog_id,
+        sweep=args.sweep,
     )
     ledger.append(
         {

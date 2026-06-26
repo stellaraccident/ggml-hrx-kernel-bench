@@ -5,6 +5,7 @@ from ggml_hrx_kernel_bench.route_schedules import (
     schedule_points_for_route,
     select_test_route,
 )
+from ggml_hrx_kernel_bench.llama_catalog import _test_schedule_for_family
 
 
 def test_edge_schedule_is_bounded_and_annotated() -> None:
@@ -73,3 +74,35 @@ def test_q4_test_route_selection_preserves_direct_preference() -> None:
 
     assert selected is not None
     assert "_direct_" in selected["id"]
+
+
+def test_llama_edge_test_schedule_exports_multiple_route_cases() -> None:
+    routes = [
+        {
+            "id": "mul_mat_q4_k_f32_direct_k256_32768_r1_32768_c1_wg256",
+            "family": "mul_mat_q4_k_f32",
+            "op": "MUL_MAT",
+            "source_id": "mul_mat_q4_k_f32",
+            "root_symbol": "@direct",
+            "shape_domain": {"k_min": 256, "k_max": 32768, "rows_min": 1, "rows_max": 32768, "cols_min": 1, "cols_max": 1},
+            "shape_guards": {"k_multiple_of": 256},
+        },
+        {
+            "id": "mul_mat_q4_k_f32_wmma64x64_f16acc_k256_8192_r64_32768_c64_wg128",
+            "family": "mul_mat_q4_k_f32",
+            "op": "MUL_MAT",
+            "source_id": "mul_mat_q4_k_f32",
+            "root_symbol": "@wmma",
+            "shape_domain": {"k_min": 256, "k_max": 8192, "rows_min": 64, "rows_max": 32768, "cols_min": 64, "cols_max": 64},
+            "shape_guards": {"k_multiple_of": 256},
+        },
+    ]
+
+    minimal = _test_schedule_for_family(target_key="gfx1100", family_id="mul_mat_q4_k_f32", routes=routes, sweep="minimal")
+    edge = _test_schedule_for_family(target_key="gfx1100", family_id="mul_mat_q4_k_f32", routes=routes, sweep="edge")
+
+    assert minimal is not None
+    assert edge is not None
+    assert len(minimal["cases"]) == 1
+    assert len(edge["cases"]) > 1
+    assert {case["expected_route_id"] for case in edge["cases"]} == {route["id"] for route in routes}
