@@ -373,6 +373,18 @@ def _normalize_route(route: dict[str, Any], *, target_key: str) -> OrderedDict[s
                 {"source": "dst.ne0", "eq_source": "src0.ne1"},
                 {"source": "dst.ne1", "eq_source": "src1.ne1"},
             ]
+    if (
+        str(route.get("family") or "") == "mul_mat_q4_k_swiglu_f32"
+        and int(route.get("abi", {}).get("binding_count", 0)) == 4
+    ):
+        constraints = out.setdefault("constraints", [])
+        no_activation_dst_overlap = {"source": "tensor_overlap.2_3", "eq": 0}
+        if no_activation_dst_overlap not in constraints:
+            # The 4-binding fused decode kernels read the activation vector for
+            # every output row. They cannot safely write the larger SWIGLU
+            # output over that input allocation when ggml's graph allocator
+            # reuses producer storage.
+            constraints.append(no_activation_dst_overlap)
     # Workload arguments are launch-config region arguments, not general shape
     # facts. Static HRX3 routes pass problem size through config bindings; only
     # preserve explicit workload_arguments emitted by the source catalog.
